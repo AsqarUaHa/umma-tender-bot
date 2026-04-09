@@ -13,8 +13,8 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
-from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 from database import Database
 from prompt import SYSTEM_PROMPT
@@ -28,14 +28,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
-if not ANTHROPIC_API_KEY:
-    raise RuntimeError("ANTHROPIC_API_KEY is not set")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set")
 
 bot = Bot(
     token=BOT_TOKEN,
@@ -43,7 +43,7 @@ bot = Bot(
 )
 dp = Dispatcher()
 db = Database()
-claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
 WELCOME_TEXT = (
@@ -113,23 +113,21 @@ async def handle_text(message: Message) -> None:
     await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
     history = await db.get_history(user.id, limit=MAX_HISTORY)
-    messages = [{"role": role, "content": content} for role, content in history]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend({"role": role, "content": content} for role, content in history)
     messages.append({"role": "user", "content": message.text})
 
     try:
-        response = await claude.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
+        response = await openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
             messages=messages,
+            max_tokens=1024,
         )
-        reply_text = "".join(
-            block.text for block in response.content if getattr(block, "type", None) == "text"
-        ).strip()
+        reply_text = (response.choices[0].message.content or "").strip()
         if not reply_text:
             reply_text = "Кешіріңіз, жауап дайындай алмадым. Қайтадан жазып көріңіз 🙏"
     except Exception as exc:
-        logger.exception("Claude API error: %s", exc)
+        logger.exception("OpenAI API error: %s", exc)
         reply_text = (
             "Қазір техникалық ақау болып тұр 😔\n"
             "Сәл күте тұрыңыз немесе кураторға жазыңыз: +7 707 853 2965"
