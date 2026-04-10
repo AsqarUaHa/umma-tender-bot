@@ -8,6 +8,7 @@ import logging
 import os
 from typing import Optional
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
@@ -141,9 +142,29 @@ async def handle_text(message: Message) -> None:
     await message.answer(reply_text)
 
 
+async def health_check(_request: web.Request) -> web.Response:
+    """Simple health-check endpoint so Railway sees the service as alive."""
+    return web.Response(text="OK")
+
+
+async def run_health_server() -> None:
+    """Start a lightweight HTTP server on $PORT (Railway assigns it)."""
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Health-check server running on port %d", port)
+
+
 async def main() -> None:
     logger.info("Initializing database...")
     await db.init()
+    logger.info("Starting health-check server...")
+    await run_health_server()
     logger.info("Starting bot...")
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
