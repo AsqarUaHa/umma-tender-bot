@@ -104,21 +104,21 @@ async def handle_text(message: Message) -> None:
     if user is None or message.text is None:
         return
 
-    await db.upsert_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
-    )
-
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-
-    history = await db.get_history(user.id, limit=MAX_HISTORY)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend({"role": role, "content": content} for role, content in history)
-    messages.append({"role": "user", "content": message.text})
-
     try:
+        await db.upsert_user(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+        )
+
+        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+
+        history = await db.get_history(user.id, limit=MAX_HISTORY)
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend({"role": role, "content": content} for role, content in history)
+        messages.append({"role": "user", "content": message.text})
+
         response = await openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
@@ -127,17 +127,16 @@ async def handle_text(message: Message) -> None:
         reply_text = (response.choices[0].message.content or "").strip()
         if not reply_text:
             reply_text = "Кешіріңіз, жауап дайындай алмадым. Қайтадан жазып көріңіз 🙏"
+
+        await db.add_message(user.id, "user", message.text)
+        await db.add_message(user.id, "assistant", reply_text)
+
     except Exception as exc:
-        logger.exception("OpenAI API error: %s", exc)
+        logger.exception("Handler error: %s", exc)
         reply_text = (
             "Қазір техникалық ақау болып тұр 😔\n"
             "Сәл күте тұрыңыз немесе кураторға жазыңыз: +7 707 853 2965"
         )
-        await message.answer(reply_text)
-        return
-
-    await db.add_message(user.id, "user", message.text)
-    await db.add_message(user.id, "assistant", reply_text)
 
     await message.answer(reply_text)
 

@@ -1,8 +1,9 @@
 """MySQL database layer using aiomysql."""
 
+import contextlib
 import logging
 import os
-from typing import List, Optional, Tuple
+from typing import AsyncIterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiomysql
@@ -47,6 +48,8 @@ class Database:
             minsize=1,
             maxsize=5,
             charset="utf8mb4",
+            pool_recycle=300,
+            connect_timeout=10,
         )
         await self._create_tables()
 
@@ -55,9 +58,19 @@ class Database:
             self.pool.close()
             await self.pool.wait_closed()
 
-    async def _create_tables(self) -> None:
+    @contextlib.asynccontextmanager
+    async def _acquire(self) -> AsyncIterator[aiomysql.Connection]:
+        """Acquire a connection and ping it to ensure it's alive."""
         assert self.pool is not None
-        async with self.pool.acquire() as conn:
+        conn = await self.pool.acquire()
+        try:
+            await conn.ping(reconnect=True)
+            yield conn
+        finally:
+            self.pool.release(conn)
+
+    async def _create_tables(self) -> None:
+        async with self._acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
@@ -91,8 +104,7 @@ class Database:
         first_name: Optional[str],
         last_name: Optional[str],
     ) -> None:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
@@ -107,8 +119,7 @@ class Database:
                 )
 
     async def add_message(self, user_id: int, role: str, content: str) -> None:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)",
@@ -116,8 +127,7 @@ class Database:
                 )
 
     async def get_history(self, user_id: int, limit: int = 20) -> List[Tuple[str, str]]:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
@@ -136,7 +146,6 @@ class Database:
                 return [(row[0], row[1]) for row in rows]
 
     async def clear_history(self, user_id: int) -> None:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM messages WHERE user_id = %s", (user_id,))
