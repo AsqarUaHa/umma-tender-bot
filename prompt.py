@@ -1,6 +1,11 @@
 """System prompt for Ержан — UMMA Tender Academy AI assistant."""
 
+from pathlib import Path
+
 from videos import VIDEO_CATALOG
+
+_KNOWLEDGE_PATH = Path(__file__).parent / "knowledge.md"
+_KNOWLEDGE_TEXT = _KNOWLEDGE_PATH.read_text(encoding="utf-8")
 
 _PROMPT_TEMPLATE = """# Роль
 Ты — онлайн ИИ-ассистент компании UMMA Тендер Академия. Тебя зовут Ержан.
@@ -161,6 +166,15 @@ _PROMPT_TEMPLATE = """# Роль
 Помогаешь сделать первый результат.
 
 НАПОМИНАНИЕ: все ответы ТОЛЬКО на казахском языке, простым разговорным стилем.
+
+# База білімі (FAQ)
+Ниже — база знаний с ответами на часто задаваемые вопросы. Когда клиент задаёт вопрос, СНАЧАЛА ищи ответ здесь. Если вопрос найден — дай ответ из базы, можно адаптировать стиль, но НЕ выдумывай факты. Если вопроса в базе нет — отвечай на основе своих знаний в рамках Рекорд 1.0.
+
+{KNOWLEDGE_BASE}
 """
 
-SYSTEM_PROMPT = _PROMPT_TEMPLATE.replace("{VIDEO_CATALOG}", VIDEO_CATALOG)
+SYSTEM_PROMPT = (
+    _PROMPT_TEMPLATE
+    .replace("{VIDEO_CATALOG}", VIDEO_CATALOG)
+    .replace("{KNOWLEDGE_BASE}", _KNOWLEDGE_TEXT)
+)
