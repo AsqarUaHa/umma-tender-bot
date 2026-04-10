@@ -1,6 +1,9 @@
 """
 UMMA Tender Academy — Telegram bot "Ержан"
 AI-ассистент по тендерам для студентов продукта «Рекорд 1.0».
+
+Runs in WEBHOOK mode so Railway Serverless can scale to zero
+and wake up on incoming Telegram updates.
 """
 
 import asyncio
@@ -13,7 +16,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, Update
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -32,6 +36,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
+
+# Webhook config
+PORT = int(os.getenv("PORT", "8080"))
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -142,35 +151,55 @@ async def handle_text(message: Message) -> None:
 
 
 async def health_check(_request: web.Request) -> web.Response:
-    """Simple health-check endpoint so Railway sees the service as alive."""
+    """Health-check endpoint for Railway."""
     return web.Response(text="OK")
 
 
-async def run_health_server() -> None:
-    """Start a lightweight HTTP server on $PORT (Railway assigns it)."""
-    port = int(os.getenv("PORT", "8080"))
+async def on_startup(app: web.Application) -> None:
+    """Set up webhook and DB on app startup."""
+    logger.info("Initializing database...")
+    await db.init()
+
+    if RAILWAY_PUBLIC_DOMAIN:
+        webhook_url = f"https://{RAILWAY_PUBLIC_DOMAIN}{WEBHOOK_PATH}"
+        logger.info("Setting webhook: %s", webhook_url)
+        await bot.set_webhook(
+            url=webhook_url,
+            drop_pending_updates=False,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+    else:
+        logger.warning(
+            "RAILWAY_PUBLIC_DOMAIN is not set — webhook will not be registered. "
+            "Set it in Railway service Settings → Networking → Public Domain."
+        )
+
+
+async def on_shutdown(app: web.Application) -> None:
+    """Clean up on shutdown."""
+    logger.info("Shutting down...")
+    await bot.delete_webhook()
+    await db.close()
+    await bot.session.close()
+
+
+def main() -> None:
+    """Start the bot in webhook mode behind an aiohttp server."""
     app = web.Application()
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info("Health-check server running on port %d", port)
 
+    # Register startup / shutdown hooks
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
 
-async def main() -> None:
-    logger.info("Initializing database...")
-    await db.init()
-    logger.info("Starting health-check server...")
-    await run_health_server()
-    logger.info("Starting bot...")
-    try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    finally:
-        await db.close()
-        await bot.session.close()
+    # Mount the aiogram webhook handler
+    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+    webhook_handler.register(app, path=WEBHOOK_PATH)
+
+    logger.info("Starting webhook server on port %d ...", PORT)
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
