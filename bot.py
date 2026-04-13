@@ -22,7 +22,8 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 from database import Database
-from prompt import SYSTEM_PROMPT
+from prompt import build_system_prompt
+from rag import KnowledgeRAG
 
 load_dotenv()
 
@@ -54,6 +55,7 @@ bot = Bot(
 dp = Dispatcher()
 db = Database()
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+rag = KnowledgeRAG(client=openai_client)
 
 
 WELCOME_TEXT = (
@@ -123,8 +125,12 @@ async def handle_text(message: Message) -> None:
 
         await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
+        # RAG: find relevant knowledge for this query
+        rag_context = await rag.search(message.text)
+        system_prompt = build_system_prompt(rag_context)
+
         history = await db.get_history(user.id, limit=MAX_HISTORY)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": system_prompt}]
         messages.extend({"role": role, "content": content} for role, content in history)
         messages.append({"role": "user", "content": message.text})
 
@@ -159,6 +165,9 @@ async def on_startup(app: web.Application) -> None:
     """Set up webhook and DB on app startup."""
     logger.info("Initializing database...")
     await db.init()
+
+    logger.info("Initializing RAG knowledge base...")
+    await rag.init()
 
     if RAILWAY_PUBLIC_DOMAIN:
         webhook_url = f"https://{RAILWAY_PUBLIC_DOMAIN}{WEBHOOK_PATH}"
