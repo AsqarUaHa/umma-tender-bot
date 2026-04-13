@@ -12,8 +12,7 @@ import re
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatAction, ParseMode
+from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -37,7 +36,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 
-# Webhook config
 PORT = int(os.getenv("PORT", "8080"))
 RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
@@ -47,7 +45,6 @@ if not BOT_TOKEN:
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 
-# ---- No default parse_mode — we send plain text ----
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 db = Database()
@@ -58,30 +55,26 @@ rag = KnowledgeRAG(client=openai_client)
 # ── Formatting ───────────────────────────────────────────────
 
 def clean_response(text: str) -> str:
-    """Remove all markdown artifacts so Telegram shows clean plain text."""
+    """Remove all markdown/HTML artifacts so Telegram shows clean plain text."""
     # Bold: **text** or __text__
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
     text = re.sub(r'__(.+?)__', r'\1', text, flags=re.DOTALL)
-    # Italic: *text* or _text_
+    # Italic: *text*
     text = re.sub(r'\*(.+?)\*', r'\1', text, flags=re.DOTALL)
     text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'\1', text, flags=re.DOTALL)
-    # Code blocks: ```...```
+    # Code blocks
     text = re.sub(r'```[\s\S]*?```', lambda m: m.group(0).strip('`').strip(), text)
-    # Inline code: `text`
     text = re.sub(r'`(.+?)`', r'\1', text)
-    # Markdown headers: ### text
+    # Headers
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    # Bullet * at line start → •
+    # Bullet points
     text = re.sub(r'^\*\s+', '• ', text, flags=re.MULTILINE)
-    # Bullet - at line start → •
     text = re.sub(r'^-\s+', '• ', text, flags=re.MULTILINE)
-    # Stray leftover asterisks (loose ** or *)
+    # Stray asterisks and HTML tags
     text = text.replace('**', '')
-    # HTML tags that might leak from prompt
-    text = re.sub(r'</?b>', '', text)
-    text = re.sub(r'</?i>', '', text)
+    text = re.sub(r'</?[bi]>', '', text)
     text = re.sub(r'</?code>', '', text)
-    # Collapse 3+ newlines into 2
+    # Collapse excessive newlines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -157,14 +150,23 @@ async def handle_text(message: Message) -> None:
 
         await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
-        # RAG: find relevant knowledge for this query
-        rag_context = await rag.search(message.text)
+        # RAG: find relevant knowledge (graceful fallback if fails)
+        rag_context = ""
+        try:
+            rag_context = await rag.search(message.text)
+        except Exception as rag_err:
+            logger.error("RAG search failed (continuing without context): %s", rag_err)
+
         system_prompt = build_system_prompt(rag_context)
 
         history = await db.get_history(user.id, limit=MAX_HISTORY)
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend({"role": role, "content": content} for role, content in history)
         messages.append({"role": "user", "content": message.text})
+
+        logger.info("Calling OpenAI model=%s, messages=%d, rag_chunks=%s",
+                     OPENAI_MODEL, len(messages),
+                     "yes" if rag_context else "no")
 
         response = await openai_client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -180,7 +182,7 @@ async def handle_text(message: Message) -> None:
         await db.add_message(user.id, "assistant", reply_text)
 
     except Exception as exc:
-        logger.exception("Handler error: %s", exc)
+        logger.exception("Handler error for user %s: %s", user.id if user else "?", exc)
         reply_text = (
             "Қазір техникалық ақау болып тұр 😔\n"
             "Сәл күте тұрыңыз немесе кураторға жазыңыз: +7 707 853 2965"
@@ -200,7 +202,11 @@ async def on_startup(app: web.Application) -> None:
     await db.init()
 
     logger.info("Initializing RAG knowledge base...")
-    await rag.init()
+    try:
+        await rag.init()
+        logger.info("RAG initialized successfully.")
+    except Exception as e:
+        logger.error("RAG init failed (bot will work without RAG): %s", e)
 
     if RAILWAY_PUBLIC_DOMAIN:
         webhook_url = f"https://{RAILWAY_PUBLIC_DOMAIN}{WEBHOOK_PATH}"
@@ -211,9 +217,7 @@ async def on_startup(app: web.Application) -> None:
             allowed_updates=dp.resolve_used_update_types(),
         )
     else:
-        logger.warning(
-            "RAILWAY_PUBLIC_DOMAIN is not set — webhook will not be registered."
-        )
+        logger.warning("RAILWAY_PUBLIC_DOMAIN is not set — webhook not registered.")
 
 
 async def on_shutdown(app: web.Application) -> None:
