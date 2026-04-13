@@ -6,19 +6,17 @@ Runs in WEBHOOK mode so Railway Serverless can scale to zero
 and wake up on incoming Telegram updates.
 """
 
-import asyncio
 import logging
 import os
 import re
-from typing import Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, Update
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.types import Message
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -49,38 +47,50 @@ if not BOT_TOKEN:
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
+# ---- No default parse_mode — we send plain text ----
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 db = Database()
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 rag = KnowledgeRAG(client=openai_client)
 
 
-def _clean_markdown(text: str) -> str:
-    """Strip markdown formatting that Telegram HTML mode can't render."""
-    # **bold** or __bold__ → just the text
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'__(.+?)__', r'\1', text)
-    # *italic* or _italic_ → just the text
-    text = re.sub(r'\*(.+?)\*', r'\1', text)
-    text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'\1', text)
-    # ```code blocks``` → just the text
-    text = re.sub(r'```[\s\S]*?```', lambda m: m.group(0).strip('`').strip(), text)
-    # `inline code` → just the text
-    text = re.sub(r'`(.+?)`', r'\1', text)
-    # ### headers → just the text
-    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    # Leftover standalone * or ** at line start (bullet points)
-    text = re.sub(r'^\*\s+', '• ', text, flags=re.MULTILINE)
-    return text
+# ── Formatting ───────────────────────────────────────────────
 
+def clean_response(text: str) -> str:
+    """Remove all markdown artifacts so Telegram shows clean plain text."""
+    # Bold: **text** or __text__
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'__(.+?)__', r'\1', text, flags=re.DOTALL)
+    # Italic: *text* or _text_
+    text = re.sub(r'\*(.+?)\*', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'\1', text, flags=re.DOTALL)
+    # Code blocks: ```...```
+    text = re.sub(r'```[\s\S]*?```', lambda m: m.group(0).strip('`').strip(), text)
+    # Inline code: `text`
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    # Markdown headers: ### text
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Bullet * at line start → •
+    text = re.sub(r'^\*\s+', '• ', text, flags=re.MULTILINE)
+    # Bullet - at line start → •
+    text = re.sub(r'^-\s+', '• ', text, flags=re.MULTILINE)
+    # Stray leftover asterisks (loose ** or *)
+    text = text.replace('**', '')
+    # HTML tags that might leak from prompt
+    text = re.sub(r'</?b>', '', text)
+    text = re.sub(r'</?i>', '', text)
+    text = re.sub(r'</?code>', '', text)
+    # Collapse 3+ newlines into 2
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ── Static texts ─────────────────────────────────────────────
 
 WELCOME_TEXT = (
     "Сәлем! 👋\n\n"
-    "Мен <b>Ержан</b>, UMMA Тендер Академиясының ИИ-ассистентімін. "
+    "Мен Ержан, UMMA Тендер Академиясының ИИ-ассистентімін. "
     "«Рекорд 1.0» курсының студенттеріне тендер бойынша көмектесемін.\n\n"
     "Сұрағыңызды жазыңыз, бәрін қарапайым тілмен түсіндіріп беремін 😊\n\n"
     "Командалар:\n"
@@ -92,7 +102,7 @@ WELCOME_TEXT = (
 HELP_TEXT = (
     "Мен сізге келесі сұрақтарда көмектесе аламын:\n\n"
     "• ИП ашу, ЭЦП алу\n"
-    "• NCLayer орнату\n"
+    "• NCALayer орнату\n"
     "• zakup.sk.kz порталына тіркелу\n"
     "• Товарлы тендерлерді іздеу\n"
     "• Тендерге өтінім беру\n"
@@ -100,6 +110,8 @@ HELP_TEXT = (
     "Жай ғана сұрағыңызды жазыңыз 😊"
 )
 
+
+# ── Handlers ─────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def handle_start(message: Message) -> None:
@@ -160,7 +172,7 @@ async def handle_text(message: Message) -> None:
             max_tokens=1024,
         )
         reply_text = (response.choices[0].message.content or "").strip()
-        reply_text = _clean_markdown(reply_text)
+        reply_text = clean_response(reply_text)
         if not reply_text:
             reply_text = "Кешіріңіз, жауап дайындай алмадым. Қайтадан жазып көріңіз 🙏"
 
@@ -177,13 +189,13 @@ async def handle_text(message: Message) -> None:
     await message.answer(reply_text)
 
 
+# ── Server ───────────────────────────────────────────────────
+
 async def health_check(_request: web.Request) -> web.Response:
-    """Health-check endpoint for Railway."""
     return web.Response(text="OK")
 
 
 async def on_startup(app: web.Application) -> None:
-    """Set up webhook and DB on app startup."""
     logger.info("Initializing database...")
     await db.init()
 
@@ -200,13 +212,11 @@ async def on_startup(app: web.Application) -> None:
         )
     else:
         logger.warning(
-            "RAILWAY_PUBLIC_DOMAIN is not set — webhook will not be registered. "
-            "Set it in Railway service Settings → Networking → Public Domain."
+            "RAILWAY_PUBLIC_DOMAIN is not set — webhook will not be registered."
         )
 
 
 async def on_shutdown(app: web.Application) -> None:
-    """Clean up on shutdown."""
     logger.info("Shutting down...")
     await bot.delete_webhook()
     await db.close()
@@ -214,16 +224,13 @@ async def on_shutdown(app: web.Application) -> None:
 
 
 def main() -> None:
-    """Start the bot in webhook mode behind an aiohttp server."""
     app = web.Application()
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
 
-    # Register startup / shutdown hooks
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    # Mount the aiogram webhook handler
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_handler.register(app, path=WEBHOOK_PATH)
 
