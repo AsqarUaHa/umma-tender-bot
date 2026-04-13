@@ -2,20 +2,21 @@
 UMMA Tender Academy — Telegram bot "Ержан"
 AI-ассистент по тендерам для студентов продукта «Рекорд 1.0».
 
-Runs in WEBHOOK mode so Railway Serverless can scale to zero
-and wake up on incoming Telegram updates.
+Runs in POLLING mode — no public domain needed.
+Also exposes a health-check endpoint for Railway.
 """
 
+import asyncio
 import logging
 import os
 import re
+import threading
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -35,10 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
-
 PORT = int(os.getenv("PORT", "8080"))
-RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -56,25 +54,18 @@ rag = KnowledgeRAG(client=openai_client)
 
 def clean_response(text: str) -> str:
     """Remove all markdown/HTML artifacts so Telegram shows clean plain text."""
-    # Bold: **text** or __text__
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
     text = re.sub(r'__(.+?)__', r'\1', text, flags=re.DOTALL)
-    # Italic: *text*
     text = re.sub(r'\*(.+?)\*', r'\1', text, flags=re.DOTALL)
     text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'\1', text, flags=re.DOTALL)
-    # Code blocks
     text = re.sub(r'```[\s\S]*?```', lambda m: m.group(0).strip('`').strip(), text)
     text = re.sub(r'`(.+?)`', r'\1', text)
-    # Headers
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    # Bullet points
     text = re.sub(r'^\*\s+', '• ', text, flags=re.MULTILINE)
     text = re.sub(r'^-\s+', '• ', text, flags=re.MULTILINE)
-    # Stray asterisks and HTML tags
     text = text.replace('**', '')
     text = re.sub(r'</?[bi]>', '', text)
     text = re.sub(r'</?code>', '', text)
-    # Collapse excessive newlines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -155,7 +146,7 @@ async def handle_text(message: Message) -> None:
         try:
             rag_context = await rag.search(message.text)
         except Exception as rag_err:
-            logger.error("RAG search failed (continuing without context): %s", rag_err)
+            logger.error("RAG search failed: %s", rag_err)
 
         system_prompt = build_system_prompt(rag_context)
 
@@ -164,9 +155,8 @@ async def handle_text(message: Message) -> None:
         messages.extend({"role": role, "content": content} for role, content in history)
         messages.append({"role": "user", "content": message.text})
 
-        logger.info("Calling OpenAI model=%s, messages=%d, rag_chunks=%s",
-                     OPENAI_MODEL, len(messages),
-                     "yes" if rag_context else "no")
+        logger.info("OpenAI call: model=%s, msgs=%d, rag=%s",
+                     OPENAI_MODEL, len(messages), "yes" if rag_context else "no")
 
         response = await openai_client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -191,56 +181,54 @@ async def handle_text(message: Message) -> None:
     await message.answer(reply_text)
 
 
-# ── Server ───────────────────────────────────────────────────
+# ── Health-check server (background thread) ──────────────────
 
-async def health_check(_request: web.Request) -> web.Response:
-    return web.Response(text="OK")
+def _run_health_server() -> None:
+    """Run a minimal HTTP server for Railway health checks."""
+    async def _serve() -> None:
+        app = web.Application()
+        app.router.add_get("/", lambda _: web.Response(text="OK"))
+        app.router.add_get("/health", lambda _: web.Response(text="OK"))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        logger.info("Health-check server on port %d", PORT)
+        # Keep running forever
+        await asyncio.Event().wait()
+
+    asyncio.run(_serve())
 
 
-async def on_startup(app: web.Application) -> None:
+# ── Main ─────────────────────────────────────────────────────
+
+async def main() -> None:
+    # Start health-check in a background thread so Railway sees the port
+    health_thread = threading.Thread(target=_run_health_server, daemon=True)
+    health_thread.start()
+
+    # Init services
     logger.info("Initializing database...")
     await db.init()
 
     logger.info("Initializing RAG knowledge base...")
     try:
         await rag.init()
-        logger.info("RAG initialized successfully.")
+        logger.info("RAG initialized: %d chunks", len(rag.chunks))
     except Exception as e:
-        logger.error("RAG init failed (bot will work without RAG): %s", e)
+        logger.error("RAG init failed (will work without): %s", e)
 
-    if RAILWAY_PUBLIC_DOMAIN:
-        webhook_url = f"https://{RAILWAY_PUBLIC_DOMAIN}{WEBHOOK_PATH}"
-        logger.info("Setting webhook: %s", webhook_url)
-        await bot.set_webhook(
-            url=webhook_url,
-            drop_pending_updates=False,
-            allowed_updates=dp.resolve_used_update_types(),
-        )
-    else:
-        logger.warning("RAILWAY_PUBLIC_DOMAIN is not set — webhook not registered.")
+    # Delete any old webhook and start polling
+    logger.info("Deleting old webhook (if any)...")
+    await bot.delete_webhook(drop_pending_updates=True)
 
-
-async def on_shutdown(app: web.Application) -> None:
-    logger.info("Shutting down...")
-    await bot.delete_webhook()
-    await db.close()
-    await bot.session.close()
-
-
-def main() -> None:
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
-
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    webhook_handler.register(app, path=WEBHOOK_PATH)
-
-    logger.info("Starting webhook server on port %d ...", PORT)
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    logger.info("Starting polling...")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await db.close()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
