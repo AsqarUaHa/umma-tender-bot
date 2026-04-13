@@ -9,6 +9,7 @@ and wake up on incoming Telegram updates.
 import asyncio
 import logging
 import os
+import re
 from typing import Optional
 
 from aiohttp import web
@@ -56,6 +57,25 @@ dp = Dispatcher()
 db = Database()
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 rag = KnowledgeRAG(client=openai_client)
+
+
+def _clean_markdown(text: str) -> str:
+    """Strip markdown formatting that Telegram HTML mode can't render."""
+    # **bold** or __bold__ → just the text
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    # *italic* or _italic_ → just the text
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'\1', text)
+    # ```code blocks``` → just the text
+    text = re.sub(r'```[\s\S]*?```', lambda m: m.group(0).strip('`').strip(), text)
+    # `inline code` → just the text
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    # ### headers → just the text
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Leftover standalone * or ** at line start (bullet points)
+    text = re.sub(r'^\*\s+', '• ', text, flags=re.MULTILINE)
+    return text
 
 
 WELCOME_TEXT = (
@@ -140,6 +160,7 @@ async def handle_text(message: Message) -> None:
             max_tokens=1024,
         )
         reply_text = (response.choices[0].message.content or "").strip()
+        reply_text = _clean_markdown(reply_text)
         if not reply_text:
             reply_text = "Кешіріңіз, жауап дайындай алмадым. Қайтадан жазып көріңіз 🙏"
 
