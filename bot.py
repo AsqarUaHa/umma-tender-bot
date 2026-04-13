@@ -171,7 +171,7 @@ async def handle_text(message: Message) -> None:
         response = await openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            max_tokens=1024,
+            max_completion_tokens=1024,
         )
         reply_text = (response.choices[0].message.content or "").strip()
         reply_text = clean_response(reply_text)
